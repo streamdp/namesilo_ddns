@@ -1,85 +1,47 @@
 #!/bin/bash
 
-##Domain name:
-DOMAIN="mydomain.tld"
+## Domain name:
+domain="example.com"
 
-##Host name (subdomain). Optional. If present, must end with a dot (.)
-HOST="subdomain."
+## Host name (subdomain). Optional.
+subdomain="sub1"
 
-##APIKEY obtained from Namesilo:
-APIKEY="c40031261ee449037a4b4"
+## apikey obtained from Namesilo:
+apikey="apikey"
 
-## Do not edit lines below ##
-
-##Saved history pubic IP from last check
-IP_FILE="/var/tmp/MyPubIP"
-
-##Time IP last updated or 'No IP change' log message output
-IP_TIME="/var/tmp/MyIPTime"
-
-##How often to output 'No IP change' log messages
-NO_IP_CHANGE_TIME=86400
-
-##Response from Namesilo
-RESPONSE="/tmp/namesilo_response.xml"
-
-##Choose randomly which OpenDNS resolver to use
-RESOLVER=resolver$(echo $((($RANDOM%4)+1))).opendns.com
-##Get the current public IP using DNS
-CUR_IP="$(dig +short myip.opendns.com @$RESOLVER)"
-ODRC=$?
-
-## Try google dns if opendns failed
-if [ $ODRC -ne 0 ]; then
-   logger -t IP.Check -- IP Lookup at $RESOLVER failed!
-   sleep 5
-##Choose randomly which Google resolver to use
-   RESOLVER=ns$(echo $((($RANDOM%4)+1))).google.com
-##Get the current public IP 
-   IPQUOTED=$(dig TXT +short o-o.myaddr.l.google.com @$RESOLVER)
-   GORC=$?
-## Exit if google failed
-   if [ $GORC -ne 0 ]; then
-     logger -t IP.Check -- IP Lookup at $RESOLVER failed!
-     exit 1
-   fi
-   CUR_IP=$(echo $IPQUOTED | awk -F'"' '{ print $2}')
+## Update DNS record in Namesilo:
+full_name=$domain
+if [ ! -z "${subdomain}" ]; then
+  full_name=$subdomain.$domain
 fi
 
-##Check file for previous IP address
-if [ -f $IP_FILE ]; then
-  KNOWN_IP=$(cat $IP_FILE)
-else
-  KNOWN_IP=
+ip_file="/tmp/$full_name.lastip"
+
+cur_ip=$(curl -s https://ip-info.oncook.top/client-ip | jq -r  '.content.ip')
+
+known_ip=""
+if [ -f $ip_file ]; then
+  known_ip=$(cat $ip_file)
 fi
 
-##See if the IP has changed
-if [ "$CUR_IP" != "$KNOWN_IP" ]; then
-  echo $CUR_IP > $IP_FILE
-  logger -t IP.Check -- Public IP changed to $CUR_IP from $RESOLVER
+if [ "$cur_ip" != "$known_ip" ]; then
+  echo $cur_ip > $ip_file
+  logger -t ddns_check -- subdomain ip changed to $cur_ip for $subdomain.$domain, let\'s try updating
 
-  ##Update DNS record in Namesilo:
-  curl -s "https://www.namesilo.com/api/dnsListRecords?version=1&type=xml&key=$APIKEY&domain=$DOMAIN" > $DOMAIN.xml 
-  RECORD_ID=`xmllint --xpath "//namesilo/reply/resource_record/record_id[../host/text() = '$HOST$DOMAIN' ]" $DOMAIN.xml | grep -oP '(?<=<record_id>).*?(?=</record_id>)'`
-  curl -s "https://www.namesilo.com/api/dnsUpdateRecord?version=1&type=xml&key=$APIKEY&domain=$DOMAIN&rrid=$RECORD_ID&rrhost=$HOST&rrvalue=$CUR_IP&rrttl=3600" > $RESPONSE
-    RESPONSE_CODE=`xmllint --xpath "//namesilo/reply/code/text()"  $RESPONSE`
-       case $RESPONSE_CODE in
-       300)
-         date "+%s" > $IP_TIME
-         logger -t IP.Check -- Update success. Now $HOST$DOMAIN IP address is $CUR_IP;;
-       280)
-         logger -t IP.Check -- Duplicate record exists. No update necessary;;
-       *)
-         ## put the old IP back, so that the update will be tried next time
-         echo $KNOWN_IP > $IP_FILE
-         logger -t IP.Check -- DDNS update failed code $RESPONSE_CODE!;;
-     esac
+  ## Update DNS record in Namesilo:
+  record_id=$(curl -s "https://www.namesilo.com/api/dnsListRecords?version=1&type=json&key=${apikey}&domain=${domain}" | jq -r --arg host ${full_name} '.reply.resource_record[] | select(.host==$host).record_id')
+  response_code=$(curl -s "https://www.namesilo.com/api/dnsUpdateRecord?version=1&type=json&key=${apikey}&domain=${domain}&rrid=${record_id}&rrsubdomain=${subdomain}&rrvalue=${cur_ip}&rrttl=3600" | jq -r '.reply.code')
 
-else
-  ## Only log all these events NO_IP_CHANGE_TIME after last update
-  [ $(date "+%s") -gt $((($(cat $IP_TIME)+$NO_IP_CHANGE_TIME))) ] &&
-    logger -t IP.Check -- NO IP change from $RESOLVER &&
-    date "+%s" > $IP_TIME
+  case $response_code in
+    300)
+      logger -t ddns_check -- update success;;
+    280)
+      logger -t ddns_check -- no update necessary;;
+    *)
+      echo $known_ip > $ip_file
+      logger -t ddns_check -- update failed \($response_code\)!
+      exit 1;;
+  esac
 fi
 
 exit 0
